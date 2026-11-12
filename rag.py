@@ -8,11 +8,18 @@ from google.genai import types
 from pypdf import PdfReader
 
 EMBED_MODEL = "gemini-embedding-001"
-CHAT_MODEL = "gemini-2.5-flash"
+# Chat models to try, in order. If one is busy (503), the next one is used.
+CHAT_MODELS = ["gemini-3.5-flash-lite", "gemini-3.7-flash", "gemini-3.8-flash"]
 DB_DIR = "chroma_db"
 COLLECTION = "docs"
 
-client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+client = genai.Client(
+    api_key=os.environ["GEMINI_API_KEY"],
+    http_options=types.HttpOptions(
+        timeout=60_000,                                       # give up on a call after 60 seconds
+        retry_options=types.HttpRetryOptions(attempts=1),     # no hidden retries: we handle them ourselves
+    ),
+)
 
 
 # ---------- Step 1: read ----------
@@ -74,7 +81,8 @@ def embed(texts, task, batch_size=20):
         else:
             raise RuntimeError("Still rate-limited after 5 tries. Try again in a few minutes.")
         vectors.extend(emb.values for emb in result.embeddings)
-        time.sleep(1)                       # small pause between batches
+        if i + batch_size < len(texts):     # pause only if more batches are coming
+            time.sleep(1)
     return vectors
 
 
@@ -111,3 +119,40 @@ def retrieve(question, k=4):
         hits.append({"text": text, "source": meta["source"], "page": meta["page"],
                      "distance": round(dist, 3)})
     return hits
+
+
+# ---------- Step 6: generate ----------
+MAX_DISTANCE = 0.40   # from Step 5: relevant chunks were <= 0.36, unrelated >= 0.447
+
+PROMPT = """You are a helpful assistant for students of Symbiosis Institute of Technology, Pune.
+Answer the question using ONLY the context below, which comes from college documents.
+If the answer is not in the context, reply exactly: "I couldn't find that in the documents."
+Keep the answer short and clear. After each fact, cite its source like [file.pdf, p.3].
+
+Context:
+{context}
+
+Question: {question}
+Answer:"""
+
+
+def generate(prompt):
+    """Send the prompt to the first chat model that is available. Returns the answer text."""
+    for model in CHAT_MODELS:
+        try:
+            response = client.models.generate_content(model=model, contents=prompt)
+            return response.text
+        except Exception as err:
+            print(f"[{model} unavailable: {str(err)[:60]}... trying the next model]")
+    return "Sorry, the AI service is busy right now. Please try again in a minute."
+
+
+def answer(question, k=4):
+    """Find relevant chunks, then ask Gemini to answer using only those chunks."""
+    hits = retrieve(question, k)
+    good = [h for h in hits if h["distance"] <= MAX_DISTANCE]
+    if not good:                       # safety net 1: nothing relevant, so don't ask Gemini at all
+        return "I couldn't find that in the documents.", []
+    context = "\n\n".join(f"[{h['source']}, p.{h['page']}]\n{h['text']}" for h in good)
+    reply = generate(PROMPT.format(context=context, question=question))
+    return reply, good
