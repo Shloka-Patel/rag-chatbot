@@ -1,5 +1,6 @@
 """Core RAG pipeline: read -> chunk -> embed -> store -> retrieve -> answer."""
 import os
+import re
 import time
 
 import chromadb
@@ -9,14 +10,14 @@ from pypdf import PdfReader
 
 EMBED_MODEL = "gemini-embedding-001"
 # Chat models to try, in order. If one is busy (503), the next one is used.
-CHAT_MODELS = ["gemini-3.5-flash-lite", "gemini-3.7-flash", "gemini-3.8-flash"]
+CHAT_MODELS = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash", "gemini-3.7-flash"] 
 DB_DIR = "chroma_db"
 COLLECTION = "docs"
 
 client = genai.Client(
     api_key=os.environ["GEMINI_API_KEY"],
     http_options=types.HttpOptions(
-        timeout=60_000,                                       # give up on a call after 60 seconds
+        timeout=30_000,                                       # give up on a call after 30 seconds
         retry_options=types.HttpRetryOptions(attempts=1),     # no hidden retries: we handle them ourselves
     ),
 )
@@ -35,25 +36,51 @@ def load_pdf(path):
 
 
 # ---------- Step 2: chunk ----------
+# A section heading in the syllabus looks like "Semester : 7 Generic Core Courses"
+# or "Semester : 5 Data Science Specialisation". Sometimes the heading is the last
+# thing on a page and its section name is on the next page ("Semester : 2 Page: 7").
+HEADING = re.compile(r"Semester\s*:\s*(\d)\s+(?:(.{0,60}?(?:Courses|Specialisation))|(?=Page:))")
+
+
 def chunk_pages(pages, source, size=800, overlap=150, min_chars=30):
     """Split each page into overlapping pieces, remembering where each came from.
-    Skips tiny scraps (under 30 characters) that carry no real meaning."""
+    Skips tiny scraps (under 30 characters) that carry no real meaning.
+    Labels each chunk with the section heading it falls under (e.g. "Semester 7,
+    Generic Core Courses"), even when that heading was on an earlier page."""
     chunks = []
+    section = None                           # the most recent heading seen so far
     for p in pages:
         text = " ".join(p["text"].split())  # collapse extra spaces/newlines
+        headings = []
+        for m in HEADING.finditer(text):
+            kind = m.group(2)
+            if not kind:                     # name is on the next page: guess it from the previous heading
+                previous = headings[-1][1] if headings else (section or "")
+                kind = "Specialisation courses" if "Specialisation" in previous else "Generic Core Courses"
+            if "Specialisation" in kind:
+                kind += " (optional Honours/Minor track)"
+            else:
+                kind += " (main programme)"
+            headings.append((m.start(), f"Semester {m.group(1)}, {kind}"))
         start = 0
         while start < len(text):
             piece = text[start:start + size]
+            for pos, name in headings:       # use any heading that starts before the middle of this piece
+                if pos < start + len(piece) // 2:
+                    section = name
             if len(piece) >= min_chars:
+                label = f"[Section: {section}] " if section else ""
                 chunks.append({
                     "id": f"{source}-p{p['page']}-{start}",   # unique name for each chunk
-                    "text": piece,
+                    "text": label + piece,
                     "source": source,
                     "page": p["page"],
                 })
             if start + size >= len(text):   # reached the end of the page: stop,
                 break                       # don't make a tiny leftover scrap
             start += size - overlap   # move forward 650, so 150 characters repeat
+        if headings:                         # a heading near the end of a page carries on to the next page
+            section = headings[-1][1]
     return chunks
 
 
@@ -93,10 +120,17 @@ def get_collection():
     return db.get_or_create_collection(COLLECTION, metadata={"hnsw:space": "cosine"})
 
 
+# Pages deliberately left out of the database: personal contact details the bot doesn't need.
+SKIP_PAGES = {
+    "Final-Placement-Brochure-2023-27-batch.pdf": [22],   # student coordinators' names and phone numbers
+}
+
+
 def index_pdf(path, source=None):
     """Read, chunk, embed and store one PDF. Returns the number of chunks."""
     source = source or os.path.basename(path)
-    chunks = chunk_pages(load_pdf(path), source)
+    pages = [p for p in load_pdf(path) if p["page"] not in SKIP_PAGES.get(source, [])]
+    chunks = chunk_pages(pages, source) 
     print(f"Embedding {len(chunks)} chunks from {source}...")
     vectors = embed([c["text"] for c in chunks], "RETRIEVAL_DOCUMENT")
     get_collection().upsert(
@@ -127,6 +161,12 @@ MAX_DISTANCE = 0.40   # from Step 5: relevant chunks were <= 0.36, unrelated >= 
 PROMPT = """You are a helpful assistant for students of Symbiosis Institute of Technology, Pune.
 Answer the question using ONLY the context below, which comes from college documents.
 If the answer is not in the context, reply exactly: "I couldn't find that in the documents."
+If the context answers only part of the question, give that part and say what may be missing.
+The context may contain tables flattened into plain text. Each course row starts with codes
+like "TE7692 0701230704" followed by the course title; "[Section: ...]" tells you which
+"(main programme)" courses are what every student takes. "(optional Honours/Minor track)"
+courses are extra, optional specialisation courses. When asked about a semester's courses,
+list the main programme courses first, and mention specialisation courses only as optional extras.
 Keep the answer short and clear. After each fact, cite its source like [file.pdf, p.3].
 
 Context:
@@ -136,18 +176,23 @@ Question: {question}
 Answer:"""
 
 
-def generate(prompt):
-    """Send the prompt to the first chat model that is available. Returns the answer text."""
-    for model in CHAT_MODELS:
-        try:
-            response = client.models.generate_content(model=model, contents=prompt)
-            return response.text
-        except Exception as err:
-            print(f"[{model} unavailable: {str(err)[:60]}... trying the next model]")
+def generate(prompt, rounds=3):
+    """Send the prompt to the first chat model that is available. Returns the answer text.
+    If every model is busy, wait a little and go round the list again (up to 3 rounds)."""
+    for round_number in range(1, rounds + 1):
+        for model in CHAT_MODELS:
+            try:
+                response = client.models.generate_content(model=model, contents=prompt)
+                return response.text
+            except Exception as err:
+                print(f"[round {round_number}: {model} unavailable: {str(err)[:40]}...]")
+        if round_number < rounds:
+            wait = 10 * round_number            # wait 10 s, then 20 s: busy servers often recover quickly
+            print(f"[all models busy, waiting {wait} seconds before trying again]")
+            time.sleep(wait)
     return "Sorry, the AI service is busy right now. Please try again in a minute."
 
-
-def answer(question, k=4):
+def answer(question, k=8):
     """Find relevant chunks, then ask Gemini to answer using only those chunks."""
     hits = retrieve(question, k)
     good = [h for h in hits if h["distance"] <= MAX_DISTANCE]
@@ -155,4 +200,4 @@ def answer(question, k=4):
         return "I couldn't find that in the documents.", []
     context = "\n\n".join(f"[{h['source']}, p.{h['page']}]\n{h['text']}" for h in good)
     reply = generate(PROMPT.format(context=context, question=question))
-    return reply, good
+    return reply, good 
